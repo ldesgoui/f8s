@@ -9,10 +9,16 @@
   };
 
   outputs = { self, nixpkgs, rust-overlay, ... }: {
-    devShell.x86_64-linux = nixpkgs.legacyPackages.x86_64-linux.mkShell {
-      buildInputs = [
-        rust-overlay.defaultPackage.x86_64-linux
-      ];
-    };
+    devShell.x86_64-linux =
+      let pkgs =
+        nixpkgs.legacyPackages.x86_64-linux;
+      in
+      pkgs.mkShell {
+        buildInputs = [
+          pkgs.fuse3
+          pkgs.pkg-config
+          rust-overlay.defaultPackage.x86_64-linux
+        ];
+      };
   };
 }

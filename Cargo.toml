@@ -5,3 +5,12 @@ authors = ["ldesgoui <ldesgoui@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+# color-eyre = "0.5"
+# eyre = "0.6"
+fuse_mt = { git = "https://github.com/wfraser/fuse-mt" }
+# k8s-openapi = { version = "0.11", features = ["v1_18"] }
+# kube = { version = "0.52", default-features = false, features = ["rustls-tls"] }
+libc = "0.2"
+log = "0.4"
+pretty_env_logger = "0.4"
+# thiserror = "1"
