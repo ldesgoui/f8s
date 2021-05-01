@@ -8,17 +8,32 @@
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, ... }: {
-    devShell.x86_64-linux =
-      let pkgs =
-        nixpkgs.legacyPackages.x86_64-linux;
-      in
-      pkgs.mkShell {
+  outputs = { self, nixpkgs, rust-overlay, ... }:
+    let
+      supportedSystems = [
+        "x86_64-linux"
+      ];
+
+      overlays = [
+        rust-overlay.overlay
+      ];
+
+      genSystems = nixpkgs.lib.genAttrs supportedSystems;
+      genSystemsWithPkgs = f: genSystems (system: f (import nixpkgs { inherit system overlays; }));
+    in
+    {
+      devShell = genSystemsWithPkgs (pkgs: pkgs.mkShell {
         buildInputs = [
-          pkgs.fuse3
+          # pkgs.fuse3
+          pkgs.cargo-watch
+          pkgs.k9s
+          pkgs.kubectl
           pkgs.pkg-config
-          rust-overlay.defaultPackage.x86_64-linux
+          pkgs.rust-bin.stable.latest.default
         ];
-      };
-  };
+
+        F8S_LOG = "debug";
+        RUST_BACKTRACE = "full";
+      });
+    };
 }
