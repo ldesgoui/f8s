@@ -5,15 +5,15 @@ authors = ["ldesgoui <ldesgoui@gmail.com>"]
 edition = "2018"
 
 [features]
-default = ["k8s-openapi/v1_20"]
+default = ["k8s-openapi/v1_20", "polyfuse-undocumented"]
+polyfuse-undocumented = []
 
 [dependencies]
 color-eyre = "0.5"
 eyre = "0.6"
 log = "0.4"
-# pretty_env_logger = "0.4"
+pretty_env_logger = "0.4"
 thiserror = "1"
-tracing-subscriber = "0.2"
 
 tokio = { version = "1", features = ["full"] }
 
