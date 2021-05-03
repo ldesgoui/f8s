@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 use bimap::BiMap;
-use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
 use polyfuse::{op, reply::*, KernelConfig, Operation, Request, Session};
 use std::collections::HashMap;
 use std::convert::TryFrom as _;
@@ -108,10 +108,10 @@ async fn main() -> eyre::Result<()> {
                         attrs.nlink(2);
                     }
                     Entry::ObjectNamespaced { .. } => {
-                        attrs.mode(libc::S_IFREG | libc::S_IRUSR | libc::S_IXUSR);
+                        attrs.mode(libc::S_IFREG | libc::S_IRUSR);
                     }
                     Entry::ObjectFreestanding { .. } => {
-                        attrs.mode(libc::S_IFREG | libc::S_IRUSR | libc::S_IXUSR);
+                        attrs.mode(libc::S_IFREG | libc::S_IRUSR);
                     }
                 }
 
@@ -178,15 +178,96 @@ async fn main() -> eyre::Result<()> {
                 req.reply(out)?;
             }
 
-            // TODOO lookup {namespace} when not in map
-            // TODO: lookup _/{name}.{kind}.yaml
-            // TODO: lookup {namespace}/{name}.{kind}.yaml
+            Operation::Lookup(op) if op.parent() == INO_DIR_FREESTANDING => {
+                let entry = match op
+                    .name()
+                    .to_str()
+                    .unwrap()
+                    .rsplitn(3, '.')
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    ["yaml", &ref kind, &ref name] => Entry::ObjectFreestanding {
+                        name: name.into(),
+                        kind: kind.into(),
+                    },
+                    _ => {
+                        log::warn!("lookup on file with the wrong format: {:?}", op.name());
+                        req.reply_error(libc::ENOENT)?;
+                        continue;
+                    }
+                };
+
+                let ino = map.get_by_right(&entry).copied().unwrap();
+
+                log::info!("lookup on entry: {:?}", entry);
+
+                let mut out = EntryOut::default();
+                out.ino(ino);
+                out.ttl_attr(TTL_SHORT);
+                out.ttl_entry(TTL_SHORT);
+
+                let attrs = out.attr();
+                attrs.ino(ino);
+                attrs.mode(libc::S_IFREG | libc::S_IRUSR);
+                attrs.uid(uid);
+                attrs.gid(gid);
+
+                req.reply(out)?;
+            }
+
+            Operation::Lookup(op)
+                if matches!(map.get_by_left(&op.parent()), Some(Entry::Namespace { .. })) =>
+            {
+                let namespace = map.get_by_left(&op.parent()).unwrap().file_name();
+
+                let entry = match op
+                    .name()
+                    .to_str()
+                    .unwrap()
+                    .rsplitn(3, '.')
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    ["yaml", &ref kind, &ref name] => Entry::ObjectNamespaced {
+                        namespace,
+                        name: name.into(),
+                        kind: kind.into(),
+                    },
+                    _ => {
+                        log::warn!("lookup on file with the wrong format: {:?}", op.name());
+                        req.reply_error(libc::ENOENT)?;
+                        continue;
+                    }
+                };
+
+                let ino = map.get_by_right(&entry).copied().unwrap();
+
+                log::info!("lookup on entry: {:?}", entry);
+
+                let mut out = EntryOut::default();
+                out.ino(ino);
+                out.ttl_attr(TTL_SHORT);
+                out.ttl_entry(TTL_SHORT);
+
+                let attrs = out.attr();
+                attrs.ino(ino);
+                attrs.mode(libc::S_IFREG | libc::S_IRUSR);
+                attrs.uid(uid);
+                attrs.gid(gid);
+
+                req.reply(out)?;
+            }
+
+            // TODO: {namespace} when not in map
+            // TODO: _/{name}.{kind}.yaml when not in map
+            // TODO: {namespace}/{name}.{kind}.yaml when not in map
             Operation::Lookup(op) => {
                 log::debug!("    - parent: {:?}", op.parent());
                 log::debug!("    - name: {:?}", op.name());
 
                 log::warn!("lookup with no matching case");
-                req.reply_error(libc::ENOSYS)?;
+                req.reply_error(libc::ENOENT)?;
             }
 
             Operation::Opendir(op) if op.ino() == INO_ROOT => {
@@ -204,6 +285,7 @@ async fn main() -> eyre::Result<()> {
 
                 for ns in namespaces.list(&Default::default()).await?.items {
                     let entry = Entry::from_namespace(&ns);
+                    let file_name = entry.file_name();
                     let ino = map.get_by_right(&entry).copied().unwrap_or_else(|| {
                         let ino = next_ino.fetch_add(1, Ordering::SeqCst);
                         let overwritten = map.insert(ino, entry);
@@ -218,8 +300,7 @@ async fn main() -> eyre::Result<()> {
                         ino
                     });
 
-                    let name = ns.metadata.name.unwrap();
-                    entries.push((OsString::from(name), ino, libc::DT_DIR as u32));
+                    entries.push((OsString::from(file_name), ino, libc::DT_DIR as u32));
                 }
 
                 opened_dirs.insert(fh, entries);
@@ -231,11 +312,140 @@ async fn main() -> eyre::Result<()> {
                 req.reply(out)?;
             }
 
-            // TODO: _/
-            // TODO: {namespace}/
-            // TODO: reply_error when ISREG
+            Operation::Opendir(op) if op.ino() == INO_DIR_FREESTANDING => {
+                log::info!("opendir on /_/");
+
+                let fh = next_fh.fetch_add(1, Ordering::SeqCst);
+
+                let mut entries = vec![
+                    (".".into(), INO_DIR_FREESTANDING, libc::DT_DIR as u32),
+                    ("..".into(), INO_ROOT, libc::DT_DIR as u32),
+                ];
+
+                let namespaces = kube::Api::<Namespace>::all(client.clone());
+
+                // TODO: data needed here
+                for ns in namespaces.list(&Default::default()).await?.items {
+                    let name = ns.metadata.name.unwrap();
+                    let entry = Entry::ObjectFreestanding {
+                        name: name.clone(),
+                        kind: "ns".into(),
+                    };
+                    let file_name = entry.file_name();
+                    let ino = map.get_by_right(&entry).copied().unwrap_or_else(|| {
+                        let ino = next_ino.fetch_add(1, Ordering::SeqCst);
+                        let overwritten = map.insert(ino, entry);
+
+                        if overwritten.did_overwrite() {
+                            log::error!(
+                                "wrote over something in the ino/entry mapping: {:?}",
+                                overwritten
+                            );
+                        }
+
+                        ino
+                    });
+
+                    entries.push((OsString::from(file_name), ino, libc::DT_REG as u32));
+                }
+
+                let nodes = kube::Api::<Node>::all(client.clone());
+
+                for no in nodes.list(&Default::default()).await?.items {
+                    let name = no.metadata.name.unwrap();
+                    let entry = Entry::ObjectFreestanding {
+                        name: name.clone(),
+                        kind: "no".into(),
+                    };
+                    let file_name = entry.file_name();
+                    let ino = map.get_by_right(&entry).copied().unwrap_or_else(|| {
+                        let ino = next_ino.fetch_add(1, Ordering::SeqCst);
+                        let overwritten = map.insert(ino, entry);
+
+                        if overwritten.did_overwrite() {
+                            log::error!(
+                                "wrote over something in the ino/entry mapping: {:?}",
+                                overwritten
+                            );
+                        }
+
+                        ino
+                    });
+
+                    entries.push((OsString::from(file_name), ino, libc::DT_REG as u32));
+                }
+
+                opened_dirs.insert(fh, entries);
+
+                let mut out = OpenOut::default();
+                out.fh(fh);
+                out.direct_io(true); // TODO: no clue what this does
+
+                req.reply(out)?;
+            }
+
+            Operation::Opendir(op) if map.contains_left(&op.ino()) => {
+                let entry = map.get_by_left(&op.ino()).unwrap();
+
+                log::info!("opendir on entry: {:?}", entry);
+
+                if !entry.is_dir() {
+                    req.reply_error(libc::ENOTDIR);
+                    continue;
+                }
+
+                let namespace = entry.file_name();
+                // drop(entry);
+
+                let fh = next_fh.fetch_add(1, Ordering::SeqCst);
+
+                let mut entries = vec![
+                    (".".into(), op.ino(), libc::DT_DIR as u32),
+                    ("..".into(), INO_ROOT, libc::DT_DIR as u32),
+                ];
+
+                // TODO: data needed here
+                let pods = kube::Api::<Pod>::namespaced(client.clone(), &namespace);
+
+                for po in pods.list(&Default::default()).await?.items {
+                    let entry = Entry::ObjectNamespaced {
+                        namespace: namespace.clone(),
+                        name: po.metadata.name.as_ref().unwrap().clone(),
+                        kind: "po".into(),
+                    };
+                    let file_name = entry.file_name();
+                    let ino = map.get_by_right(&entry).copied().unwrap_or_else(|| {
+                        let ino = next_ino.fetch_add(1, Ordering::SeqCst);
+                        let overwritten = map.insert(ino, entry);
+
+                        if overwritten.did_overwrite() {
+                            log::error!(
+                                "wrote over something in the ino/entry mapping: {:?}",
+                                overwritten
+                            );
+                        }
+
+                        ino
+                    });
+
+                    entries.push((OsString::from(file_name), ino, libc::DT_DIR as u32));
+                }
+
+                opened_dirs.insert(fh, entries);
+
+                let mut out = OpenOut::default();
+                out.fh(fh);
+                out.direct_io(true); // TODO: no clue what this does
+
+                req.reply(out)?;
+            }
+
             Operation::Opendir(op) => {
-                req.reply_error(libc::ENOSYS)?;
+                log::debug!("    - ino: {:?}", op.ino());
+                log::debug!("    - flags: {:?}", op.flags());
+
+                log::warn!("opendir with no matching case");
+                req.reply_error(libc::ENOENT)?;
             }
 
             Operation::Readdir(op) if op.mode() == op::ReaddirMode::Plus => {
@@ -280,7 +490,11 @@ async fn main() -> eyre::Result<()> {
             }
 
             Operation::Releasedir(op) => {
-                req.reply_error(libc::ENOSYS)?;
+                log::debug!("    - fh: {:?}", op.fh());
+                log::debug!("    - flags: {:?}", op.flags());
+
+                log::info!("releasedir with no matching case");
+                req.reply_error(libc::EBADF)?;
             }
 
             // TODO: _/{name}.{kind}.yaml
@@ -339,6 +553,17 @@ impl Entry {
 
     fn is_reg(&self) -> bool {
         !self.is_dir()
+    }
+
+    fn file_name(&self) -> String {
+        use Entry::*;
+
+        match self {
+            Namespace { name } => name.into(),
+            ObjectNamespaced { name, kind, .. } | ObjectFreestanding { name, kind } => {
+                format!("{}.{}.yaml", name, kind)
+            }
+        }
     }
 
     fn from_namespace(ns: &Namespace) -> Self {
