@@ -25,6 +25,7 @@
       devShell = genSystemsWithPkgs (pkgs: pkgs.mkShell {
         buildInputs = [
           # pkgs.fuse3
+          pkgs.bat
           pkgs.cargo-watch
           pkgs.k9s
           pkgs.kubectl
@@ -32,6 +33,7 @@
           pkgs.pkg-config
           pkgs.rust-bin.stable.latest.default
           pkgs.tree
+          pkgs.yq
         ];
 
         F8S_LOG = "debug";

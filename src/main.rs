@@ -30,6 +30,8 @@ async fn main() -> eyre::Result<()> {
 
     let mut config = KernelConfig::default();
 
+    config.atomic_o_trunc(false);
+
     #[cfg(feature = "polyfuse-undocumented")]
     {
         config.mount_option("default_permissions");
@@ -68,6 +70,31 @@ async fn main() -> eyre::Result<()> {
         log::debug!("  - op: {:?}", op);
 
         match op {
+            Operation::Getattr(op)
+                if op
+                    .fh()
+                    .map(|fh| opened_files.contains_key(&fh))
+                    .unwrap_or(false) =>
+            {
+                let entry = map.get_by_left(&op.ino()).unwrap();
+                let contents = opened_files.get(&op.fh().unwrap()).unwrap();
+
+                log::info!("getattr via fh on entry: {:?}", entry);
+
+                let mut out = AttrOut::default();
+                out.ttl(TTL_SHORT);
+
+                let attrs = out.attr();
+                attrs.ino(op.ino());
+                attrs.uid(uid);
+                attrs.gid(gid);
+                attrs.mode(libc::S_IFREG | libc::S_IRUSR);
+                attrs.nlink(1);
+                attrs.size(contents.len() as u64);
+
+                req.reply(out)?;
+            }
+
             Operation::Getattr(op) if map.contains_left(&op.ino()) => {
                 let entry = map.get_by_left(&op.ino()).unwrap();
 
@@ -87,7 +114,6 @@ async fn main() -> eyre::Result<()> {
                 } else {
                     attrs.mode(libc::S_IFREG | libc::S_IRUSR);
                     attrs.nlink(1);
-                    attrs.size(10);
                 }
 
                 req.reply(out)?;
@@ -191,7 +217,6 @@ async fn main() -> eyre::Result<()> {
                 attrs.ino(ino);
                 attrs.mode(libc::S_IFREG | libc::S_IRUSR);
                 attrs.nlink(1);
-                attrs.size(10);
                 attrs.uid(uid);
                 attrs.gid(gid);
 
@@ -238,7 +263,6 @@ async fn main() -> eyre::Result<()> {
                 let attrs = out.attr();
                 attrs.ino(ino);
                 attrs.mode(libc::S_IFREG | libc::S_IRUSR);
-                attrs.size(10);
                 attrs.uid(uid);
                 attrs.gid(gid);
 
@@ -503,28 +527,44 @@ async fn main() -> eyre::Result<()> {
             }
 
             Operation::Open(op)
-                if map
-                    .get_by_left(&op.ino())
-                    .map(Entry::is_dir)
-                    .unwrap_or(false) =>
-            {
-                log::warn!("open on a directory");
-                req.reply_error(libc::EISDIR)?;
-            }
-
-            Operation::Open(op)
                 if matches!(
                     map.get_by_left(&op.ino()),
-                    Some(Entry::ObjectFreestanding { .. })
+                    Some(Entry::ObjectFreestanding { .. }) | Some(Entry::ObjectNamespaced { .. })
                 ) =>
             {
                 let entry = map.get_by_left(&op.ino()).unwrap();
 
                 log::info!("open on entry: {:?}", entry);
 
-                let fh = next_fh.fetch_add(1, Ordering::SeqCst);
-                let contents = "HELLO LMAO".into();
+                let contents = match entry {
+                    Entry::ObjectFreestanding { name, kind } if kind == "ns" => {
+                        serde_yaml::to_string(
+                            &kube::Api::<Namespace>::all(client.clone())
+                                .get(name)
+                                .await?,
+                        )
+                    }
 
+                    Entry::ObjectFreestanding { name, kind } if kind == "no" => {
+                        serde_yaml::to_string(
+                            &kube::Api::<Node>::all(client.clone()).get(name).await?,
+                        )
+                    }
+
+                    Entry::ObjectNamespaced {
+                        namespace,
+                        name,
+                        kind,
+                    } => serde_yaml::to_string(
+                        &kube::Api::<Pod>::namespaced(client.clone(), namespace)
+                            .get(name)
+                            .await?,
+                    ),
+
+                    _ => unreachable!(),
+                }?;
+
+                let fh = next_fh.fetch_add(1, Ordering::SeqCst);
                 opened_files.insert(fh, contents);
 
                 let mut out = OpenOut::default();
@@ -535,8 +575,6 @@ async fn main() -> eyre::Result<()> {
                 req.reply(out)?;
             }
 
-            // TODO: _/{name}.{kind}.yaml
-            // TODO: {namespace}/{name}.{kind}.yaml
             // TODO: flags
             Operation::Open(op) => {
                 log::info!("    - ino: {:?}", op.ino());
@@ -560,8 +598,6 @@ async fn main() -> eyre::Result<()> {
                     out = &contents[offset..];
                     out = &out[..std::cmp::min(out.len(), size)];
                 }
-
-                dbg!(out);
 
                 req.reply(out);
             }

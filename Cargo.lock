@@ -231,6 +231,7 @@ dependencies = [
  "log",
  "polyfuse",
  "pretty_env_logger",
+ "serde_yaml",
  "thiserror",
  "tokio",
 ]
