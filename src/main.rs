@@ -1,20 +1,11 @@
-//  mountpoint
-//      _  (directory for stuff not namespaced)              
-//          default.ns.yaml
-//          kube-system.ns.yaml
-//      default
-//      kube-system
-//          coredns.deploy.yaml
-//          coredns-74ff55c5b.rs.yaml
-//          coredns-74ff55c5b-xjt82.pod.yaml
-
 #![allow(unused)]
 
 use bimap::BiMap;
 use k8s_openapi::api::core::v1::Namespace;
 use polyfuse::{op, reply::*, KernelConfig, Operation, Request, Session};
+use std::collections::HashMap;
 use std::convert::TryFrom as _;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -52,11 +43,15 @@ async fn main() -> eyre::Result<()> {
     let mut map = BiMap::<u64, Entry>::new();
     let mut next_ino = AtomicU64::new(INO_ALLOC_START);
 
+    let mut next_fh = AtomicU64::new(0x10000);
+
+    let mut opened_dirs = HashMap::<u64, Vec<(OsString, u64, u32)>>::new();
+
     while let Some(req) = session.next_request()? {
         log::debug!("request {:#x}:", req.unique());
-        log::debug!("  - uid: {:?}", req.uid());
-        log::debug!("  - gid: {:?}", req.gid());
-        log::debug!("  - pid: {:?}", req.pid());
+        // log::debug!("  - uid: {:?}", req.uid());
+        // log::debug!("  - gid: {:?}", req.gid());
+        // log::debug!("  - pid: {:?}", req.pid());
 
         let op = req.operation()?;
         log::debug!("  - op: {:?}", op);
@@ -132,6 +127,8 @@ async fn main() -> eyre::Result<()> {
             }
 
             Operation::Lookup(op) if op.parent() == INO_ROOT && op.name() == "_" => {
+                log::info!("lookup on /_/");
+
                 let mut out = EntryOut::default();
                 out.ino(INO_DIR_FREESTANDING);
                 out.ttl_attr(TTL_FOREVER);
@@ -147,47 +144,120 @@ async fn main() -> eyre::Result<()> {
                 req.reply(out)?;
             }
 
+            Operation::Lookup(op)
+                if op.parent() == INO_ROOT
+                    && map.contains_right(&Entry::Namespace {
+                        name: op.name().to_str().unwrap().into(),
+                    }) =>
+            {
+                let ino = map
+                    .get_by_right(&Entry::Namespace {
+                        name: op.name().to_str().unwrap().into(),
+                    })
+                    .copied()
+                    .unwrap();
+
+                log::info!(
+                    "lookup on namespace entry: name: {:?}, ino: {:?}",
+                    op.name(),
+                    ino
+                );
+
+                let mut out = EntryOut::default();
+                out.ino(ino);
+                out.ttl_attr(TTL_SHORT);
+                out.ttl_entry(TTL_SHORT);
+
+                let attrs = out.attr();
+                attrs.ino(ino);
+                attrs.mode(libc::S_IFDIR | libc::S_IRUSR | libc::S_IXUSR);
+                attrs.nlink(2);
+                attrs.uid(uid);
+                attrs.gid(gid);
+
+                req.reply(out)?;
+            }
+
+            // TODOO lookup {namespace} when not in map
+            // TODO: lookup _/{name}.{kind}.yaml
+            // TODO: lookup {namespace}/{name}.{kind}.yaml
             Operation::Lookup(op) => {
+                log::debug!("    - parent: {:?}", op.parent());
+                log::debug!("    - name: {:?}", op.name());
+
+                log::warn!("lookup with no matching case");
                 req.reply_error(libc::ENOSYS)?;
             }
 
+            Operation::Opendir(op) if op.ino() == INO_ROOT => {
+                log::info!("opendir on mountpoint");
+
+                let fh = next_fh.fetch_add(1, Ordering::SeqCst);
+
+                let mut entries = vec![
+                    (".".into(), INO_ROOT, libc::DT_DIR as u32),
+                    ("..".into(), INO_ROOT, libc::DT_DIR as u32),
+                    ("_".into(), INO_DIR_FREESTANDING, libc::DT_DIR as u32),
+                ];
+
+                let namespaces = kube::Api::<Namespace>::all(client.clone());
+
+                for ns in namespaces.list(&Default::default()).await?.items {
+                    let entry = Entry::from_namespace(&ns);
+                    let ino = map.get_by_right(&entry).copied().unwrap_or_else(|| {
+                        let ino = next_ino.fetch_add(1, Ordering::SeqCst);
+                        let overwritten = map.insert(ino, entry);
+
+                        if overwritten.did_overwrite() {
+                            log::error!(
+                                "wrote over something in the ino/entry mapping: {:?}",
+                                overwritten
+                            );
+                        }
+
+                        ino
+                    });
+
+                    let name = ns.metadata.name.unwrap();
+                    entries.push((OsString::from(name), ino, libc::DT_DIR as u32));
+                }
+
+                opened_dirs.insert(fh, entries);
+
+                let mut out = OpenOut::default();
+                out.fh(fh);
+                out.direct_io(true); // TODO: no clue what this does
+
+                req.reply(out)?;
+            }
+
+            // TODO: _/
+            // TODO: {namespace}/
+            // TODO: reply_error when ISREG
             Operation::Opendir(op) => {
                 req.reply_error(libc::ENOSYS)?;
             }
 
             Operation::Readdir(op) if op.mode() == op::ReaddirMode::Plus => {
+                log::warn!("readdir+");
+
                 req.reply_error(libc::ENOSYS)?;
             }
 
-            Operation::Readdir(op) if op.ino() == INO_ROOT => {
-                log::info!("readdir on mountpoint");
+            Operation::Readdir(op) if opened_dirs.contains_key(&op.fh()) => {
+                log::info!("readdir on opened dir: fh: {:?}", op.fh());
+                log::debug!("offset: {:?}", op.offset());
 
-                if op.offset() != 0 {
-                    req.reply(ReaddirOut::new(op.size() as usize))?;
-                    continue;
-                }
+                let entries = opened_dirs.get(&op.fh()).unwrap();
 
                 let mut out = ReaddirOut::new(op.size() as usize);
 
-                out.entry(&OsString::from("."), INO_ROOT, libc::DT_DIR as u32, 1);
-                out.entry(&OsString::from(".."), INO_ROOT, libc::DT_DIR as u32, 2);
-                out.entry(
-                    &OsString::from("_"),
-                    INO_DIR_FREESTANDING,
-                    libc::DT_DIR as u32,
-                    3,
-                );
+                for (offset, entry) in entries.iter().enumerate().skip(op.offset() as usize) {
+                    let filled = out.entry(&entry.0, entry.1, entry.2, offset as u64 + 1);
 
-                let namespaces = kube::Api::<Namespace>::all(client.clone());
-
-                for ns in namespaces.list(&Default::default()).await?.items {
-                    let name = ns.metadata.name.unwrap();
-                    let ino = map
-                        .get_by_right(&Entry::Namespace { name: name.clone() })
-                        .copied()
-                        .unwrap_or_else(|| 1 + 1);
-
-                    out.entry(&OsString::from(name), ino, libc::DT_DIR as u32, 69);
+                    if filled {
+                        break;
+                    };
                 }
 
                 req.reply(out)?;
@@ -200,21 +270,24 @@ async fn main() -> eyre::Result<()> {
                 log::debug!("    - size: {:?}", op.size());
                 log::debug!("    - mode: {:?}", op.mode());
 
-                log::warn!("readdir on something not found");
-                req.reply_error(libc::ENOENT)?;
+                log::warn!("readdir with no matching case");
+                req.reply_error(libc::ENOSYS)?;
+            }
+
+            Operation::Releasedir(op) if opened_dirs.contains_key(&op.fh()) => {
+                log::info!("releasing dir: fh: {:?}", op.fh());
+                opened_dirs.remove(&op.fh());
             }
 
             Operation::Releasedir(op) => {
                 req.reply_error(libc::ENOSYS)?;
             }
 
+            // TODO: _/{name}.{kind}.yaml
+            // TODO: {namespace}/{name}.{kind}.yaml
+            // TODO: reply_error when ISDIR
             Operation::Open(op) => {
                 req.reply_error(libc::ENOSYS)?;
-            }
-
-            Operation::Read(op) if op.ino() == INO_ROOT => {
-                log::warn!("read on mountpoint");
-                req.reply_error(libc::EISDIR)?;
             }
 
             Operation::Read(op) => {
@@ -225,8 +298,8 @@ async fn main() -> eyre::Result<()> {
                 log::info!("    - flags: {:?}", op.flags());
                 log::info!("    - lock_owner: {:?}", op.lock_owner());
 
-                log::warn!("read on something not found");
-                req.reply_error(libc::ENOENT)?;
+                log::warn!("read with no matching case");
+                req.reply_error(libc::ENOSYS)?;
             }
 
             Operation::Release(op) => {
@@ -257,4 +330,36 @@ enum Entry {
         name: String,
         kind: String,
     },
+}
+
+impl Entry {
+    fn is_dir(&self) -> bool {
+        matches!(self, Entry::Namespace { .. })
+    }
+
+    fn is_reg(&self) -> bool {
+        !self.is_dir()
+    }
+
+    fn from_namespace(ns: &Namespace) -> Self {
+        Self::Namespace {
+            name: ns.metadata.name.as_ref().cloned().unwrap(),
+        }
+    }
+
+    // fn object_from_resource(resource: &impl kube::Resource) -> Self {
+    //     match resource.namespace() {
+    //         Some(namespace) => {
+    //             todo!()
+    //         }
+    //         None => Self::ObjectFreestanding {
+    //             name: resource.name(),
+    //             kind: resource.kind().into(),
+    //         },
+    //     }
+    // }
+
+    // fn from_resource(resource: &impl kube::Resource) -> Self {
+    //     todo!()
+    // }
 }
