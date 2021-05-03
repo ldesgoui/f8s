@@ -86,6 +86,7 @@ async fn main() -> eyre::Result<()> {
                     attrs.nlink(2);
                 } else {
                     attrs.mode(libc::S_IFREG | libc::S_IRUSR);
+                    attrs.nlink(1);
                     attrs.size(10);
                 }
 
@@ -96,7 +97,7 @@ async fn main() -> eyre::Result<()> {
                 log::debug!("    - ino: {:?}", op.ino());
                 log::debug!("    - fh: {:?}", op.fh());
 
-                log::warn!("getattr, no matching inode");
+                log::warn!("getattr, no matching inode for: {:?}", op.ino());
                 req.reply_error(libc::EINVAL)?;
             }
 
@@ -189,6 +190,7 @@ async fn main() -> eyre::Result<()> {
                 let attrs = out.attr();
                 attrs.ino(ino);
                 attrs.mode(libc::S_IFREG | libc::S_IRUSR);
+                attrs.nlink(1);
                 attrs.size(10);
                 attrs.uid(uid);
                 attrs.gid(gid);
@@ -528,6 +530,7 @@ async fn main() -> eyre::Result<()> {
                 let mut out = OpenOut::default();
 
                 out.fh(fh);
+                out.direct_io(true); // TODO: still nto sure what this does but it makes thigns work
 
                 req.reply(out)?;
             }
@@ -644,7 +647,7 @@ impl Entry {
         use Entry::*;
 
         match self {
-            Mountpoint => "".into(),
+            Mountpoint => unreachable!(),
 
             FreestandingDir => "_".into(),
 
@@ -657,18 +660,18 @@ impl Entry {
     }
 }
 
-impl From<&'_ Namespace> for Entry {
-    fn from(ns: &Namespace) -> Self {
-        Self::NamespaceDir {
-            name: ns.metadata.name.as_ref().cloned().unwrap(),
-        }
-    }
-}
-
 impl From<Namespace> for Entry {
     fn from(ns: Namespace) -> Self {
         Self::NamespaceDir {
             name: ns.metadata.name.unwrap(),
+        }
+    }
+}
+
+impl From<&'_ Namespace> for Entry {
+    fn from(ns: &Namespace) -> Self {
+        Self::NamespaceDir {
+            name: ns.metadata.name.as_ref().cloned().unwrap(),
         }
     }
 }
