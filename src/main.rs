@@ -24,28 +24,39 @@ async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
     pretty_env_logger::try_init_custom_env("F8S_LOG")?;
 
+    // TODO: option
     let mountpoint = Path::new("./mnt");
     eyre::ensure!(mountpoint.is_dir(), "./mnt must be a dir");
 
     let mut config = KernelConfig::default();
 
-    // polyfuse hardcodes `/usr/bin/fusermount`
     #[cfg(feature = "polyfuse-undocumented")]
-    config.fusermount_path("/run/wrappers/bin/fusermount");
+    {
+        config.mount_option("default_permissions");
+
+        // polyfuse hardcodes `/usr/bin/fusermount`
+        config.fusermount_path("/run/wrappers/bin/fusermount");
+    }
 
     let session = Session::mount(mountpoint.into(), config)?;
 
+    // TODO: option --context
+    // TODO: option --kubeconfig
     let client = kube::Client::try_default().await?;
 
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    let mut map = BiMap::<u64, Entry>::new();
     let mut next_ino = AtomicU64::new(INO_ALLOC_START);
 
-    let mut next_fh = AtomicU64::new(0x10000);
+    let mut map = BiMap::<u64, Entry>::new();
+    map.insert(INO_ROOT, Entry::Mountpoint);
+    map.insert(INO_DIR_FREESTANDING, Entry::FreestandingDir);
+
+    let mut next_fh = AtomicU64::new(10000);
 
     let mut opened_dirs = HashMap::<u64, Vec<(OsString, u64, u32)>>::new();
+    let mut opened_files = HashMap::<u64, String>::new();
 
     while let Some(req) = session.next_request()? {
         log::debug!("request {:#x}:", req.unique());
@@ -57,38 +68,6 @@ async fn main() -> eyre::Result<()> {
         log::debug!("  - op: {:?}", op);
 
         match op {
-            Operation::Getattr(op) if op.ino() == INO_ROOT => {
-                log::info!("getattr on mountpoint");
-
-                let mut out = AttrOut::default();
-                out.ttl(TTL_FOREVER);
-
-                let attrs = out.attr();
-                attrs.ino(op.ino());
-                attrs.mode(libc::S_IFDIR | libc::S_IRUSR | libc::S_IXUSR);
-                attrs.nlink(2);
-                attrs.uid(uid);
-                attrs.gid(gid);
-
-                req.reply(out)?;
-            }
-
-            Operation::Getattr(op) if op.ino() == INO_DIR_FREESTANDING => {
-                log::info!("getattr on /_/");
-
-                let mut out = AttrOut::default();
-                out.ttl(TTL_FOREVER);
-
-                let attrs = out.attr();
-                attrs.ino(op.ino());
-                attrs.mode(libc::S_IFDIR | libc::S_IRUSR | libc::S_IXUSR);
-                attrs.nlink(2);
-                attrs.uid(uid);
-                attrs.gid(gid);
-
-                req.reply(out)?;
-            }
-
             Operation::Getattr(op) if map.contains_left(&op.ino()) => {
                 let entry = map.get_by_left(&op.ino()).unwrap();
 
@@ -102,17 +81,12 @@ async fn main() -> eyre::Result<()> {
                 attrs.uid(uid);
                 attrs.gid(gid);
 
-                match entry {
-                    Entry::Namespace { .. } => {
-                        attrs.mode(libc::S_IFDIR | libc::S_IRUSR | libc::S_IXUSR);
-                        attrs.nlink(2);
-                    }
-                    Entry::ObjectNamespaced { .. } => {
-                        attrs.mode(libc::S_IFREG | libc::S_IRUSR);
-                    }
-                    Entry::ObjectFreestanding { .. } => {
-                        attrs.mode(libc::S_IFREG | libc::S_IRUSR);
-                    }
+                if entry.is_dir() {
+                    attrs.mode(libc::S_IFDIR | libc::S_IRUSR | libc::S_IXUSR);
+                    attrs.nlink(2);
+                } else {
+                    attrs.mode(libc::S_IFREG | libc::S_IRUSR);
+                    attrs.size(10);
                 }
 
                 req.reply(out)?;
@@ -122,8 +96,13 @@ async fn main() -> eyre::Result<()> {
                 log::debug!("    - ino: {:?}", op.ino());
                 log::debug!("    - fh: {:?}", op.fh());
 
-                log::warn!("getattr on something not found");
-                req.reply_error(libc::ENOENT)?;
+                log::warn!("getattr, no matching inode");
+                req.reply_error(libc::EINVAL)?;
+            }
+
+            Operation::Lookup(op) if matches!(map.get_by_left(&op.parent()), None) => {
+                log::warn!("lookup, no matching inode for parent: {}", op.parent());
+                req.reply_error(libc::EINVAL)?;
             }
 
             Operation::Lookup(op) if op.parent() == INO_ROOT && op.name() == "_" => {
@@ -146,12 +125,12 @@ async fn main() -> eyre::Result<()> {
 
             Operation::Lookup(op)
                 if op.parent() == INO_ROOT
-                    && map.contains_right(&Entry::Namespace {
+                    && map.contains_right(&Entry::NamespaceDir {
                         name: op.name().to_str().unwrap().into(),
                     }) =>
             {
                 let ino = map
-                    .get_by_right(&Entry::Namespace {
+                    .get_by_right(&Entry::NamespaceDir {
                         name: op.name().to_str().unwrap().into(),
                     })
                     .copied()
@@ -210,6 +189,7 @@ async fn main() -> eyre::Result<()> {
                 let attrs = out.attr();
                 attrs.ino(ino);
                 attrs.mode(libc::S_IFREG | libc::S_IRUSR);
+                attrs.size(10);
                 attrs.uid(uid);
                 attrs.gid(gid);
 
@@ -217,9 +197,12 @@ async fn main() -> eyre::Result<()> {
             }
 
             Operation::Lookup(op)
-                if matches!(map.get_by_left(&op.parent()), Some(Entry::Namespace { .. })) =>
+                if matches!(
+                    map.get_by_left(&op.parent()),
+                    Some(Entry::NamespaceDir { .. })
+                ) =>
             {
-                let namespace = map.get_by_left(&op.parent()).unwrap().file_name();
+                let namespace = map.get_by_left(&op.parent()).unwrap().file_name(); // TODO: no
 
                 let entry = match op
                     .name()
@@ -253,6 +236,7 @@ async fn main() -> eyre::Result<()> {
                 let attrs = out.attr();
                 attrs.ino(ino);
                 attrs.mode(libc::S_IFREG | libc::S_IRUSR);
+                attrs.size(10);
                 attrs.uid(uid);
                 attrs.gid(gid);
 
@@ -262,12 +246,23 @@ async fn main() -> eyre::Result<()> {
             // TODO: {namespace} when not in map
             // TODO: _/{name}.{kind}.yaml when not in map
             // TODO: {namespace}/{name}.{kind}.yaml when not in map
+            // TODO: refactor cases above
             Operation::Lookup(op) => {
                 log::debug!("    - parent: {:?}", op.parent());
                 log::debug!("    - name: {:?}", op.name());
 
                 log::warn!("lookup with no matching case");
                 req.reply_error(libc::ENOENT)?;
+            }
+
+            Operation::Opendir(op)
+                if map
+                    .get_by_left(&op.ino())
+                    .map(|e| !e.is_dir())
+                    .unwrap_or(false) =>
+            {
+                log::warn!("opendir on something else than a dir");
+                req.reply_error(libc::ENOTDIR)?;
             }
 
             Operation::Opendir(op) if op.ino() == INO_ROOT => {
@@ -284,7 +279,7 @@ async fn main() -> eyre::Result<()> {
                 let namespaces = kube::Api::<Namespace>::all(client.clone());
 
                 for ns in namespaces.list(&Default::default()).await?.items {
-                    let entry = Entry::from_namespace(&ns);
+                    let entry = Entry::from(ns);
                     let file_name = entry.file_name();
                     let ino = map.get_by_right(&entry).copied().unwrap_or_else(|| {
                         let ino = next_ino.fetch_add(1, Ordering::SeqCst);
@@ -312,6 +307,7 @@ async fn main() -> eyre::Result<()> {
                 req.reply(out)?;
             }
 
+            // TODO: discovery
             Operation::Opendir(op) if op.ino() == INO_DIR_FREESTANDING => {
                 log::info!("opendir on /_/");
 
@@ -384,18 +380,13 @@ async fn main() -> eyre::Result<()> {
                 req.reply(out)?;
             }
 
+            // TODO: discovery
             Operation::Opendir(op) if map.contains_left(&op.ino()) => {
                 let entry = map.get_by_left(&op.ino()).unwrap();
 
                 log::info!("opendir on entry: {:?}", entry);
 
-                if !entry.is_dir() {
-                    req.reply_error(libc::ENOTDIR);
-                    continue;
-                }
-
-                let namespace = entry.file_name();
-                // drop(entry);
+                let namespace = entry.file_name(); // TODO: no
 
                 let fh = next_fh.fetch_add(1, Ordering::SeqCst);
 
@@ -440,6 +431,7 @@ async fn main() -> eyre::Result<()> {
                 req.reply(out)?;
             }
 
+            // TODO: refactor cases above
             Operation::Opendir(op) => {
                 log::debug!("    - ino: {:?}", op.ino());
                 log::debug!("    - flags: {:?}", op.flags());
@@ -473,6 +465,7 @@ async fn main() -> eyre::Result<()> {
                 req.reply(out)?;
             }
 
+            // TODO
             Operation::Readdir(op) => {
                 log::debug!("    - ino: {:?}", op.ino());
                 log::debug!("    - fh: {:?}", op.fh());
@@ -497,27 +490,107 @@ async fn main() -> eyre::Result<()> {
                 req.reply_error(libc::EBADF)?;
             }
 
+            Operation::Open(op)
+                if map
+                    .get_by_left(&op.ino())
+                    .map(Entry::is_dir)
+                    .unwrap_or(false) =>
+            {
+                log::warn!("open on a directory");
+                req.reply_error(libc::EISDIR)?;
+            }
+
+            Operation::Open(op)
+                if map
+                    .get_by_left(&op.ino())
+                    .map(Entry::is_dir)
+                    .unwrap_or(false) =>
+            {
+                log::warn!("open on a directory");
+                req.reply_error(libc::EISDIR)?;
+            }
+
+            Operation::Open(op)
+                if matches!(
+                    map.get_by_left(&op.ino()),
+                    Some(Entry::ObjectFreestanding { .. })
+                ) =>
+            {
+                let entry = map.get_by_left(&op.ino()).unwrap();
+
+                log::info!("open on entry: {:?}", entry);
+
+                let fh = next_fh.fetch_add(1, Ordering::SeqCst);
+                let contents = "HELLO LMAO".into();
+
+                opened_files.insert(fh, contents);
+
+                let mut out = OpenOut::default();
+
+                out.fh(fh);
+
+                req.reply(out)?;
+            }
+
             // TODO: _/{name}.{kind}.yaml
             // TODO: {namespace}/{name}.{kind}.yaml
-            // TODO: reply_error when ISDIR
+            // TODO: flags
             Operation::Open(op) => {
+                log::info!("    - ino: {:?}", op.ino());
+                log::info!("    - flags: {:?}", op.flags());
+
+                log::warn!("open with no matching case");
                 req.reply_error(libc::ENOSYS)?;
             }
 
+            Operation::Read(op) if opened_files.contains_key(&op.fh()) => {
+                let contents = opened_files.get(&op.fh()).unwrap().as_bytes();
+
+                log::info!("read on fh: {:?}", op.fh());
+
+                let mut out: &[u8] = &[];
+
+                let offset = op.offset() as usize;
+
+                if offset < contents.len() {
+                    let size = op.size() as usize;
+                    out = &contents[offset..];
+                    out = &out[..std::cmp::min(out.len(), size)];
+                }
+
+                dbg!(out);
+
+                req.reply(out);
+            }
+
+            // TODO
             Operation::Read(op) => {
                 log::info!("    - ino: {:?}", op.ino());
                 log::info!("    - fh: {:?}", op.fh());
-                log::info!("    - offset: {:?}", op.size());
+                log::info!("    - offset: {:?}", op.offset());
                 log::info!("    - size: {:?}", op.size());
                 log::info!("    - flags: {:?}", op.flags());
                 log::info!("    - lock_owner: {:?}", op.lock_owner());
 
                 log::warn!("read with no matching case");
-                req.reply_error(libc::ENOSYS)?;
+                req.reply_error(libc::EINVAL)?; // XXX: not ENOSYS cus of no-open support
+            }
+
+            Operation::Release(op) if opened_files.contains_key(&op.fh()) => {
+                log::info!("releasing file: fh: {:?}", op.fh());
+                opened_files.remove(&op.fh());
             }
 
             Operation::Release(op) => {
-                req.reply_error(libc::ENOSYS)?;
+                log::info!("    - ino: {:?}", op.ino());
+                log::info!("    - fh: {:?}", op.fh());
+                log::info!("    - flags: {:?}", op.flags());
+                log::info!("    - lock_owner: {:?}", op.lock_owner());
+                log::info!("    - flush: {:?}", op.flush());
+                log::info!("    - flock_release: {:?}", op.flock_release());
+
+                log::warn!("release with no matching case");
+                req.reply_error(libc::EINVAL)?;
             }
 
             _ => req.reply_error(libc::ENOSYS)?,
@@ -529,18 +602,26 @@ async fn main() -> eyre::Result<()> {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 enum Entry {
-    // {name}/
-    Namespace {
-        name: String,
-    },
-    // {namespace}/{name}.{kind}.yaml
-    ObjectNamespaced {
-        namespace: String,
+    // /
+    Mountpoint,
+
+    // /_/
+    FreestandingDir,
+
+    // /_/{name}.{kind}.yaml
+    ObjectFreestanding {
         name: String,
         kind: String,
     },
-    // _/{name}.{kind}.yaml
-    ObjectFreestanding {
+
+    // /{name}/
+    NamespaceDir {
+        name: String,
+    },
+
+    // /{namespace}/{name}.{kind}.yaml
+    ObjectNamespaced {
+        namespace: String,
         name: String,
         kind: String,
     },
@@ -548,43 +629,46 @@ enum Entry {
 
 impl Entry {
     fn is_dir(&self) -> bool {
-        matches!(self, Entry::Namespace { .. })
+        use Entry::*;
+
+        matches!(self, Mountpoint | FreestandingDir | NamespaceDir { .. })
     }
 
-    fn is_reg(&self) -> bool {
-        !self.is_dir()
+    fn is_regular(&self) -> bool {
+        use Entry::*;
+
+        matches!(self, ObjectFreestanding { .. } | ObjectNamespaced { .. })
     }
 
     fn file_name(&self) -> String {
         use Entry::*;
 
         match self {
-            Namespace { name } => name.into(),
+            Mountpoint => "".into(),
+
+            FreestandingDir => "_".into(),
+
+            NamespaceDir { name } => name.into(),
+
             ObjectNamespaced { name, kind, .. } | ObjectFreestanding { name, kind } => {
                 format!("{}.{}.yaml", name, kind)
             }
         }
     }
+}
 
-    fn from_namespace(ns: &Namespace) -> Self {
-        Self::Namespace {
+impl From<&'_ Namespace> for Entry {
+    fn from(ns: &Namespace) -> Self {
+        Self::NamespaceDir {
             name: ns.metadata.name.as_ref().cloned().unwrap(),
         }
     }
+}
 
-    // fn object_from_resource(resource: &impl kube::Resource) -> Self {
-    //     match resource.namespace() {
-    //         Some(namespace) => {
-    //             todo!()
-    //         }
-    //         None => Self::ObjectFreestanding {
-    //             name: resource.name(),
-    //             kind: resource.kind().into(),
-    //         },
-    //     }
-    // }
-
-    // fn from_resource(resource: &impl kube::Resource) -> Self {
-    //     todo!()
-    // }
+impl From<Namespace> for Entry {
+    fn from(ns: Namespace) -> Self {
+        Self::NamespaceDir {
+            name: ns.metadata.name.unwrap(),
+        }
+    }
 }

@@ -31,6 +31,7 @@
           pkgs.openssl
           pkgs.pkg-config
           pkgs.rust-bin.stable.latest.default
+          pkgs.tree
         ];
 
         F8S_LOG = "debug";
