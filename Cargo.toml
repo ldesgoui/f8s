@@ -15,10 +15,15 @@ log = "0.4"
 pretty_env_logger = "0.4"
 thiserror = "1"
 
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 tokio = { version = "1", features = ["full"] }
 
 k8s-openapi = "0.11"
-kube = { version = "0.52", default-features = false, features = ["rustls-tls"] }
+# https://github.com/ctz/hyper-rustls/issues/56
+# kube = { version = "0.52", default-features = false, features = ["rustls-tls"] }
+kube = "0.52"
 
 libc = "0.2"
 polyfuse = "0.4"
+
+bimap = "0.6"

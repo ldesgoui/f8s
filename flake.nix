@@ -28,6 +28,7 @@
           pkgs.cargo-watch
           pkgs.k9s
           pkgs.kubectl
+          pkgs.openssl
           pkgs.pkg-config
           pkgs.rust-bin.stable.latest.default
         ];
