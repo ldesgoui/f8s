@@ -1,5 +1,5 @@
 //  mountpoint
-//      .not-namespaced
+//      _  (directory for stuff not namespaced)              
 //          default.ns.yaml
 //          kube-system.ns.yaml
 //      default
@@ -44,9 +44,7 @@ async fn main() -> eyre::Result<()> {
 
     let session = Session::mount(mountpoint.into(), config)?;
 
-    let mut config = kube::Config::infer().await?;
-    config.accept_invalid_certs = true;
-    let client = kube::Client::try_from(config)?;
+    let client = kube::Client::try_default().await?;
 
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
